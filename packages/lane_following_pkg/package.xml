@@ -1,0 +1,11 @@
+<package>
+  <name>lane_following_pkg</name>
+  <version>0.0.1</version>
+  <description>
+    Lane following package for Duckiebot.
+  </description>
+  <maintainer email="YOUR_EMAIL@EXAMPLE.COM">steffen</maintainer>
+  <license>None</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+</package>
