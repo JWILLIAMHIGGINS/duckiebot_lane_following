@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+# STEFFEN
+
 import os
 import rospy
 from duckietown.dtros import DTROS, NodeType
