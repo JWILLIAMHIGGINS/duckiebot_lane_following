@@ -5,17 +5,12 @@ source /environment.sh
 # initialize launch file
 dt-launchfile-init
 
-echo "Starting lane following with test camera..."
+echo "Starting lane following..."
 
-# Start test camera publisher in background
-rosrun lane_following_pkg test_camera_publisher.py &
+# Start vision processing node in background
+rosrun lane_following_pkg vision_processing_node.py &
 
-# Wait for publisher to start
-sleep 2
-
-# Start vision processing node
-rosrun lane_following_pkg vision_processing_node.py
-
+# Start web camera viewer (runs in foreground)
 rosrun lane_following_pkg web_camera_node.py
 
 # wait for app to end
