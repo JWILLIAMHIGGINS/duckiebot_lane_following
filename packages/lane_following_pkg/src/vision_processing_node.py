@@ -6,13 +6,14 @@ import os
 import rospy
 from duckietown.dtros import DTROS, NodeType
 from sensor_msgs.msg import CompressedImage
+from geometry_msgs.msg import Point
 import cv2
 from cv_bridge import CvBridge
 import numpy as np
 
 def find_line_intersection(line_1, line_2):
     """
-        Find intersection point of two lines given in polar coordinates
+        Find intersection point (x,y) of two lines given in polar coordinates
     """
     r_1, theta_1 = line_1[0], line_1[1]
     a_white = -1*np.cos(theta_1)/np.sin(theta_1)
@@ -41,10 +42,14 @@ class Vision_Processing_Node(DTROS):
         # Subscribe to camera (compressed)
         self.sub = rospy.Subscriber(self._camera_topic, CompressedImage, self._on_image, queue_size=1)
 
+        # Publisher for vanishing point and midpoint
+        self.vanish_pub = rospy.Publisher(f"/{self._vehicle_name}/lane_following/vanishing_point", Point, queue_size=10)
+        self.mid_pub = rospy.Publisher(f"/{self._vehicle_name}/lane_following/mid_point", Point, queue_size=10)
+
         # Publish debug image (note: topic name WITHOUT /compressed suffix)
         # ROS will automatically add /compressed when you subscribe
         self.pub_debug = rospy.Publisher(
-            f"/{self._vehicle_name}/lane_detection/debug/image/compressed", 
+            f"/{self._vehicle_name}/lane_following/debug/image/compressed", 
             CompressedImage, 
             queue_size=10
         )
@@ -113,13 +118,30 @@ class Vision_Processing_Node(DTROS):
             yellow_line_avrg = (np.mean(yellow_lines[:, 0, 0]), np.mean(yellow_lines[:, 0, 1]))        # (r, theta)
 
             # Find vanishing point as intersection of guidelines
-            vanishing_point = find_line_intersection(white_line_avrg, yellow_line_avrg)
+            vanishing_point = Point()
+            vanishing_point.x, vanishing_point.y = find_line_intersection(white_line_avrg, yellow_line_avrg)
 
             # Find midpoint as center of intersection of guidelines with abscissa
             abscissa = (img_height, np.pi/2)            # (y = 0*x + img_height)
             intersec_wh_absc = find_line_intersection(white_line_avrg, abscissa)
             intersec_yl_absc = find_line_intersection(yellow_line_avrg, abscissa)
-            midpoint = (int( np.mean([intersec_wh_absc[0], intersec_yl_absc[0]]) ), abscissa[0])     # Calculate mean of the two x-coordinates
+            midpoint = Point()
+            midpoint.x, midpoint.y = (int( np.mean([intersec_wh_absc[0], intersec_yl_absc[0]]) ), abscissa[0])     # Calculate mean of the two x-coordinates
+
+            # Shift x value to make it relative to image center (create NEW Point objects!)
+            vanishing_point_center_coords = Point()
+            vanishing_point_center_coords.x = vanishing_point.x - img_width // 2
+            vanishing_point_center_coords.y = vanishing_point.y
+            vanishing_point_center_coords.z = 0.0
+            
+            midpoint_center_coords = Point()
+            midpoint_center_coords.x = midpoint.x - img_width // 2
+            midpoint_center_coords.y = midpoint.y
+            midpoint_center_coords.z = 0.0
+
+            # Publish vanishing point and midpoint
+            self.vanish_pub.publish(vanishing_point_center_coords)
+            self.mid_pub.publish(midpoint_center_coords)
 
 
         # Draw lines
@@ -150,12 +172,14 @@ class Vision_Processing_Node(DTROS):
                 
         if white_lines is not None and yellow_lines is not None:
             # Draw vanishing point
-            if(img_height > vanishing_point[0] >= 0 and img_width > vanishing_point[1] >= 0):
-                cv2.circle(image_grayscale_BGR, (int(vanishing_point[0]), int(vanishing_point[1])), 5, (0,255,0), -1)
+            if(img_height > vanishing_point.x >= 0 and img_width > vanishing_point.y >= 0):
+                cv2.circle(image_grayscale_BGR, (int(vanishing_point.x), int(vanishing_point.y)), 5, (0,255,0), -1)
             
             # Draw midpoint
-            if(img_height > midpoint[0] >= 0):
-                cv2.circle(image_grayscale_BGR, (int(midpoint[0]), int(midpoint[1])), 15, (0,255,0), -1)
+            if(img_height > midpoint.x >= 0):
+                cv2.circle(image_grayscale_BGR, (int(midpoint.x), int(midpoint.y)), 15, (0,255,0), -1)
+
+
 
         # Debug: Convert grayscale image back to CompressedImage
         debug_msg = self._bridge.cv2_to_compressed_imgmsg(image_grayscale_BGR)
