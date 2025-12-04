@@ -120,6 +120,9 @@ class Vision_Processing_Node(DTROS):
             # Find vanishing point as intersection of guidelines
             vanishing_point = Point()
             vanishing_point.x, vanishing_point.y = find_line_intersection(white_line_avrg, yellow_line_avrg)
+            
+            # Clamp vanishing point x coordinate to image boundaries
+            vanishing_point.x = max(0, min(img_width-1, vanishing_point.x))
 
             # Find midpoint as center of intersection of guidelines with abscissa
             abscissa = (img_height, np.pi/2)            # (y = 0*x + img_height)
@@ -127,6 +130,9 @@ class Vision_Processing_Node(DTROS):
             intersec_yl_absc = find_line_intersection(yellow_line_avrg, abscissa)
             midpoint = Point()
             midpoint.x, midpoint.y = (int( np.mean([intersec_wh_absc[0], intersec_yl_absc[0]]) ), abscissa[0])     # Calculate mean of the two x-coordinates
+            
+            # Clamp midpoint x coordinate to image boundaries
+            midpoint.x = max(0, min(img_width-1, midpoint.x))
 
             # Shift x value to make it relative to image center (create NEW Point objects!)
             vanishing_point_center_coords = Point()
