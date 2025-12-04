@@ -8,7 +8,8 @@ import rospy
 from duckietown.dtros import DTROS, NodeType
 from geometry_msgs.msg import Point
 from duckietown_msgs.msg import WheelsCmdStamped
-from std_msgs.msg import Float64
+from std_msgs.msg import Float64, Bool
+from std_srvs.srv import Empty, EmptyResponse
 
 class LaneControllerNode(DTROS):
     def __init__(self, node_name):
@@ -16,20 +17,20 @@ class LaneControllerNode(DTROS):
 
         # Declare and get parameters
         # Set default parameters on parameter server
-        if rospy.has_param('~k1'):
+        if not rospy.has_param('~k1'):
             rospy.set_param('~k1', 0.3)  # Reduced from 1.0
-        if rospy.has_param('~k2'):
+        if not rospy.has_param('~k2'):
             rospy.set_param('~k2', 0.3)  # Reduced from 1.0
-        if rospy.has_param('~k3'):
+        if not rospy.has_param('~k3'):
             rospy.set_param('~k3', 0.3)  # Reduced from 1.0
-        if rospy.has_param('~kp'):
+        if not rospy.has_param('~kp'):
             rospy.set_param('~kp', 0.001)  # Reduced from 2.0 - this is the proportional gain for midpoint error
-        if rospy.has_param('~ki'):
-            rospy.set_param('~ki', 0.0001)  # Integral gain
-        if rospy.has_param('~kd'):
+        if not rospy.has_param('~ki'):
+            rospy.set_param('~ki', 0.0005)  # Integral gain
+        if not rospy.has_param('~kd'):
             rospy.set_param('~kd', 0.00001)  # Derivative gain
         if not rospy.has_param('~v'):
-            rospy.set_param('~v', 0.01)  # forward speed (m/s)
+            rospy.set_param('~v', 0.005)  # forward speed (m/s)
         if not rospy.has_param('~L'):
             rospy.set_param('~L', 0.094)  # wheelbase (m)
         if not rospy.has_param('~R'):
@@ -50,6 +51,9 @@ class LaneControllerNode(DTROS):
         self.last_error = 0.0
         self.last_time = None
         
+        # Controller enable/disable
+        self.controller_enabled = True
+        
         # Cache parameters (read once at init, update periodically)
         self.update_parameters()
         self.param_update_counter = 0
@@ -63,6 +67,12 @@ class LaneControllerNode(DTROS):
         # Publisher
         self.wheels_pub = rospy.Publisher(f"/{self._vehicle_name}/wheels_driver_node/wheels_cmd", WheelsCmdStamped, queue_size=10)
         self.omega_pub = rospy.Publisher(f"/{self._vehicle_name}/lane_controller/omega", Float64, queue_size=10)
+        self.enabled_pub = rospy.Publisher(f"/{self._vehicle_name}/lane_controller/enabled", Bool, queue_size=10)
+        
+        # Services for runtime control
+        self.reset_srv = rospy.Service(f"/{self._vehicle_name}/lane_controller/reset", Empty, self.reset_callback)
+        self.enable_srv = rospy.Service(f"/{self._vehicle_name}/lane_controller/enable", Empty, self.enable_callback)
+        self.disable_srv = rospy.Service(f"/{self._vehicle_name}/lane_controller/disable", Empty, self.disable_callback)
         
         # Register shutdown hook to stop wheels when node dies
         rospy.on_shutdown(self.shutdown_hook)
@@ -98,10 +108,20 @@ class LaneControllerNode(DTROS):
         if self.x_v is None or self.x_m is None:
             return
         
+        # Check if controller is enabled
+        if not self.controller_enabled:
+            # Send zero command when disabled
+            cmd = WheelsCmdStamped()
+            cmd.header.stamp = rospy.Time.now()
+            cmd.vel_left = 0.0
+            cmd.vel_right = 0.0
+            self.wheels_pub.publish(cmd)
+            return
+        
         # Update parameters every 100 calls (~3 seconds at 30Hz) instead of every call
         self.param_update_counter += 1
         if self.param_update_counter >= 100:
-            self.update_ctrl_parameters()
+            self.update_parameters()
             self.param_update_counter = 0
 
         # Compute omega using control law (Eq. 1)
@@ -162,6 +182,41 @@ class LaneControllerNode(DTROS):
         cmd.vel_left = float(v_l)
         cmd.vel_right = float(v_r)
         self.wheels_pub.publish(cmd)
+        
+        # Publish controller enabled status
+        enabled_msg = Bool()
+        enabled_msg.data = self.controller_enabled
+        self.enabled_pub.publish(enabled_msg)
+    
+    def reset_callback(self, req):
+        """Service callback to reset PID controller state"""
+        self.log("Resetting PID controller state")
+        self.integral_error = 0.0
+        self.last_error = 0.0
+        self.last_time = None
+        return EmptyResponse()
+    
+    def enable_callback(self, req):
+        """Service callback to enable controller"""
+        self.log("Enabling controller")
+        self.controller_enabled = True
+        return EmptyResponse()
+    
+    def disable_callback(self, req):
+        """Service callback to disable controller"""
+        self.log("Disabling controller")
+        self.controller_enabled = False
+        # Reset PID state when disabling
+        self.integral_error = 0.0
+        self.last_error = 0.0
+        self.last_time = None
+        # Send zero command
+        cmd = WheelsCmdStamped()
+        cmd.header.stamp = rospy.Time.now()
+        cmd.vel_left = 0.0
+        cmd.vel_right = 0.0
+        self.wheels_pub.publish(cmd)
+        return EmptyResponse()
 
     def shutdown_hook(self):
         """Called when node is shutting down - stop the wheels"""
