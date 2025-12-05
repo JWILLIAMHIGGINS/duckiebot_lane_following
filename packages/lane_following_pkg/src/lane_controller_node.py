@@ -51,23 +51,29 @@ class LaneControllerNode(DTROS):
         self.last_error = 0.0
         self.last_time = None
         
-        # Controller enable/disable
-        self.controller_enabled = True
+        # Output enable/disable (controlled by services only)
+        self.enable_output = False  # False at startup, only services can change this
         
+        # Controller enable/disable (controlled by corner detection)
+        self.controller_enabled = True  # Start enabled, corner detection will toggle this
+        
+        self.corner_detected = False  # True if corner was detected
+
         # Cache parameters (read once at init, update periodically)
         self.update_parameters()
         self.param_update_counter = 0
 
         self._vehicle_name = os.environ.get('VEHICLE_NAME', 'deutschbot')
 
-        # Subscribers
-        self.vanish_sub = rospy.Subscriber(f"/{self._vehicle_name}/lane_following/vanishing_point", Point, self.vanishing_callback, queue_size=10)
-        self.mid_sub = rospy.Subscriber(f"/{self._vehicle_name}/lane_following/mid_point", Point, self.middle_callback, queue_size=10)
-
-        # Publisher
+        # Publishers (create BEFORE subscribers to avoid AttributeError in callbacks)
         self.wheels_pub = rospy.Publisher(f"/{self._vehicle_name}/wheels_driver_node/wheels_cmd", WheelsCmdStamped, queue_size=10)
         self.omega_pub = rospy.Publisher(f"/{self._vehicle_name}/lane_controller/omega", Float64, queue_size=10)
         self.enabled_pub = rospy.Publisher(f"/{self._vehicle_name}/lane_controller/enabled", Bool, queue_size=10)
+        
+        # Subscribers (create AFTER publishers so callbacks can use them)
+        self.vanish_sub = rospy.Subscriber(f"/{self._vehicle_name}/lane_following/vanishing_point", Point, self.vanishing_callback, queue_size=10)
+        self.mid_sub = rospy.Subscriber(f"/{self._vehicle_name}/lane_following/mid_point", Point, self.middle_callback, queue_size=10)
+        self.corner_sub = rospy.Subscriber(f"/{self._vehicle_name}/lane_following/corner_detected", Bool, self.corner_callback, queue_size=10)
         
         # Services for runtime control
         self.reset_srv = rospy.Service(f"/{self._vehicle_name}/lane_controller/reset", Empty, self.reset_callback)
@@ -79,14 +85,28 @@ class LaneControllerNode(DTROS):
         
         self.log("LaneControllerNode initialized.")
 
+
     def vanishing_callback(self, msg):
         self.x_v = msg.x
         self.try_compute_control()
 
     def middle_callback(self, msg):
         self.x_m = msg.x
-        self.try_compute_control()  # AKTIVIERT - jetzt läuft Controller bei jedem Topic-Update
+        self.try_compute_control()
     
+    def corner_callback(self, msg):
+        prev_corner_detected = self.corner_detected
+        self.corner_detected = msg.data
+
+        if self.corner_detected:
+            self.log("Corner detected - disabling controller")
+            self.controller_enabled = False
+            self.try_compute_control()
+        elif not self.corner_detected and prev_corner_detected:     # Check for transition from True to False
+            self.log("Corner cleared - enabling controller")
+            self.controller_enabled = True
+
+
     def update_parameters(self):
         """Update controller parameters from parameter server"""
         self.k1 = rospy.get_param('~k1', 0.5)
@@ -105,59 +125,66 @@ class LaneControllerNode(DTROS):
         self.v = rospy.get_param('~v', 0.0)
 
     def try_compute_control(self):
-        if self.x_v is None or self.x_m is None:
-            return
-        
-        # Check if controller is enabled
-        if not self.controller_enabled:
-            # Send zero command when disabled
-            cmd = WheelsCmdStamped()
-            cmd.header.stamp = rospy.Time.now()
-            cmd.vel_left = 0.0
-            cmd.vel_right = 0.0
-            self.wheels_pub.publish(cmd)
-            return
-        
         # Update parameters every 100 calls (~3 seconds at 30Hz) instead of every call
         self.param_update_counter += 1
         if self.param_update_counter >= 100:
             self.update_parameters()
             self.param_update_counter = 0
+        
+        # Check if output is disabled via service -> stop immediately
+        if not self.enable_output:
+            # Send zero command when output disabled
+            cmd = WheelsCmdStamped()
+            cmd.header.stamp = rospy.Time.now()
+            cmd.vel_left = 0.0
+            cmd.vel_right = 0.0
+            #self.wheels_pub.publish(cmd)
+            return
+    
+        # Set omega based on controller state
+        if self.corner_detected:
+            # Constant turning velocity
+            omega = 0.1
 
-        # Compute omega using control law (Eq. 1)
-        denom = self.k1 * self.k3 + self.x_m * self.x_v
-        if abs(denom) < 1e-6:
-            self.log('Denominator too small, skipping control update.')
+            self.log("Corner maneuver: setting constant omega=0.1")
+        elif self.controller_enabled:
+            # PID Controller on vanishing point error
+            if self.x_v is None or self.x_m is None:
+                return
+
+            # Error: we want vanishing point at center (x_v = 0)
+            error = 0 - self.x_v
+            
+            # Calculate dt for integral and derivative terms
+            current_time = rospy.Time.now()
+            if self.last_time is None:
+                dt = 0.0
+            else:
+                dt = (current_time - self.last_time).to_sec()
+            self.last_time = current_time
+            
+            # Integral term with anti-windup
+            if dt > 0:
+                self.integral_error += error * dt
+                # Anti-windup: limit integral term
+                max_integral = self.omega_max / max(self.ki, 1e-6)
+                self.integral_error = max(-max_integral, min(max_integral, self.integral_error))
+            
+            # Derivative term
+            if dt > 0:
+                derivative = (error - self.last_error) / dt
+            else:
+                derivative = 0.0
+            self.last_error = error
+
+            omega = self.kp * error + self.ki * self.integral_error + self.kd * derivative
+
+            self.log(f"PID: e={error:.2f}, I={self.integral_error:.2f}, D={derivative:.2f}, ω={omega:.3f}")
+        
+        else:
+            # This should never happen due to early return, but add safety
             return
         
-        # PID Controller on vanishing point error
-        # Error: we want vanishing point at center (x_v = 0)
-        error = 0 - self.x_v
-        
-        # Calculate dt for integral and derivative terms
-        current_time = rospy.Time.now()
-        if self.last_time is None:
-            dt = 0.0
-        else:
-            dt = (current_time - self.last_time).to_sec()
-        self.last_time = current_time
-        
-        # Integral term with anti-windup
-        if dt > 0:
-            self.integral_error += error * dt
-            # Anti-windup: limit integral term
-            max_integral = self.omega_max / max(self.ki, 1e-6)
-            self.integral_error = max(-max_integral, min(max_integral, self.integral_error))
-        
-        # Derivative term
-        if dt > 0:
-            derivative = (error - self.last_error) / dt
-        else:
-            derivative = 0.0
-        self.last_error = error
-        
-        # PID control law
-        omega = self.kp * error + self.ki * self.integral_error + self.kd * derivative
         omega = max(-self.omega_max, min(self.omega_max, omega))
 
         # Publish omega control output
@@ -170,8 +197,6 @@ class LaneControllerNode(DTROS):
         # Solving for w_l and w_r:
         v_l = (self.v - omega * self.L / 2) / self.R
         v_r = (self.v + omega * self.L / 2) / self.R
-
-        self.log(f"PID: e={error:.2f}, I={self.integral_error:.2f}, D={derivative:.2f}, ω={omega:.3f}, v_l={v_l:.2f}, v_r={v_r:.2f}")
 
         v_l = max(-self.wheel_speed_max, min(self.wheel_speed_max, v_l))
         v_r = max(-self.wheel_speed_max, min(self.wheel_speed_max, v_r))
@@ -197,15 +222,15 @@ class LaneControllerNode(DTROS):
         return EmptyResponse()
     
     def enable_callback(self, req):
-        """Service callback to enable controller"""
-        self.log("Enabling controller")
-        self.controller_enabled = True
+        """Service callback to enable output"""
+        self.log("Enabling output")
+        self.enable_output = True
         return EmptyResponse()
     
     def disable_callback(self, req):
-        """Service callback to disable controller"""
-        self.log("Disabling controller")
-        self.controller_enabled = False
+        """Service callback to disable output"""
+        self.log("Disabling output")
+        self.enable_output = False
         # Reset PID state when disabling
         self.integral_error = 0.0
         self.last_error = 0.0

@@ -7,6 +7,7 @@ import rospy
 from duckietown.dtros import DTROS, NodeType
 from sensor_msgs.msg import CompressedImage
 from geometry_msgs.msg import Point
+from std_msgs.msg import Bool, String
 import cv2
 from cv_bridge import CvBridge
 import numpy as np
@@ -14,18 +15,35 @@ import numpy as np
 def find_line_intersection(line_1, line_2):
     """
         Find intersection point (x,y) of two lines given in polar coordinates
+        Returns None if lines are parallel or theta is too close to 0/pi (horizontal lines)
     """
     r_1, theta_1 = line_1[0], line_1[1]
+    r_2, theta_2 = line_2[0], line_2[1]
+    
+    # Check if theta is too close to 0 or pi (horizontal lines cause division by zero)
+    epsilon = 0.01  # Small threshold to avoid division by very small numbers
+    if abs(np.sin(theta_1)) < epsilon or abs(np.sin(theta_2)) < epsilon:
+        return None
+    
     a_white = -1*np.cos(theta_1)/np.sin(theta_1)
     b_white = r_1/np.sin(theta_1)
 
-    r_2, theta_2 = line_2[0], line_2[1]
     a_yellow = -1*np.cos(theta_2)/np.sin(theta_2)
     b_yellow = r_2/np.sin(theta_2)
 
+    # Check if lines are parallel (same slope)
+    if abs(a_yellow - a_white) < epsilon:
+        return None
+    
     intersec_x = (b_white - b_yellow) / (a_yellow - a_white)
     intersec_y = a_white * intersec_x + b_white
+    
+    # Check for NaN or Inf
+    if not (np.isfinite(intersec_x) and np.isfinite(intersec_y)):
+        return None
+    
     return (intersec_x, intersec_y)
+
 
 
 class Vision_Processing_Node(DTROS):
@@ -36,15 +54,23 @@ class Vision_Processing_Node(DTROS):
         self._camera_topic = f"/{self._vehicle_name}/camera_node/image/compressed"
         self._latest_jpeg = None
         
+        # State variables
+        self.corner_detected = False
+        self.corner_direction = "none"  # "left", "right", or "none"
+        
+        # Corner detection threshold (angle in radians)
+        self.corner_angle_threshold = np.pi / 6  # 30 degrees
+        
         # Bridge between OpenCV and ROS
         self._bridge = CvBridge()
 
-        # Subscribe to camera (compressed)
-        self.sub = rospy.Subscriber(self._camera_topic, CompressedImage, self._on_image, queue_size=1)
-
-        # Publisher for vanishing point and midpoint
+        # Publishers (create BEFORE subscriber to avoid AttributeError in callback)
         self.vanish_pub = rospy.Publisher(f"/{self._vehicle_name}/lane_following/vanishing_point", Point, queue_size=10)
         self.mid_pub = rospy.Publisher(f"/{self._vehicle_name}/lane_following/mid_point", Point, queue_size=10)
+        
+        # Publisher for corner detection state
+        self.corner_detected_pub = rospy.Publisher(f"/{self._vehicle_name}/lane_following/corner_detected", Bool, queue_size=10)
+        self.corner_direction_pub = rospy.Publisher(f"/{self._vehicle_name}/lane_following/corner_direction", String, queue_size=10)
 
         # Publish debug image (note: topic name WITHOUT /compressed suffix)
         # ROS will automatically add /compressed when you subscribe
@@ -53,6 +79,9 @@ class Vision_Processing_Node(DTROS):
             CompressedImage, 
             queue_size=10
         )
+
+        # Subscribe to camera (create AFTER publishers so callback can use them)
+        self.sub = rospy.Subscriber(self._camera_topic, CompressedImage, self._on_image, queue_size=1)
 
         self.log("Vision processing node initialized")
 
@@ -112,14 +141,20 @@ class Vision_Processing_Node(DTROS):
         white_lines = cv2.HoughLines(image_white_cropped, 1, np.pi/180, 70, None, 0, 0)
         yellow_lines = cv2.HoughLines(image_yellow_cropped, 1, np.pi/180, 40, None, 0, 0)
 
-        if white_lines is not None and yellow_lines is not None:
-            # Calc average lines
+        # Calc average lines
+        if white_lines is not None:
             white_line_avrg = (np.mean(white_lines[:, 0, 0]), np.mean(white_lines[:, 0, 1]))        # (r, theta)
+        if yellow_lines is not None:
             yellow_line_avrg = (np.mean(yellow_lines[:, 0, 0]), np.mean(yellow_lines[:, 0, 1]))        # (r, theta)
 
+        if white_lines is not None and yellow_lines is not None:
             # Find vanishing point as intersection of guidelines
+            intersection = find_line_intersection(white_line_avrg, yellow_line_avrg)
+            if intersection is None:
+                return
+            
             vanishing_point = Point()
-            vanishing_point.x, vanishing_point.y = find_line_intersection(white_line_avrg, yellow_line_avrg)
+            vanishing_point.x, vanishing_point.y = intersection
             
             # Clamp vanishing point x coordinate to image boundaries
             vanishing_point.x = max(0, min(img_width-1, vanishing_point.x))
@@ -128,6 +163,8 @@ class Vision_Processing_Node(DTROS):
             abscissa = (img_height, np.pi/2)            # (y = 0*x + img_height)
             intersec_wh_absc = find_line_intersection(white_line_avrg, abscissa)
             intersec_yl_absc = find_line_intersection(yellow_line_avrg, abscissa)
+            if intersec_wh_absc is None or intersec_yl_absc is None:
+                return
             midpoint = Point()
             midpoint.x, midpoint.y = (int( np.mean([intersec_wh_absc[0], intersec_yl_absc[0]]) ), abscissa[0])     # Calculate mean of the two x-coordinates
             
@@ -149,6 +186,16 @@ class Vision_Processing_Node(DTROS):
             self.vanish_pub.publish(vanishing_point_center_coords)
             self.mid_pub.publish(midpoint_center_coords)
 
+        # Detect corners
+        if white_lines is not None:
+            white_line_slope = -1 * (np.cos(white_line_avrg[1]) / np.sin(white_line_avrg[1]))  # slope a of y = a*x + b
+            #self.log(f"White line slope: {white_line_slope:.2f}")
+            if 0.1 < white_line_slope < 0.80 and yellow_lines is None:      # Corner detected if yellow line is not visible anymore
+                #self.log("Corner detected on white line")
+                corner_detected = True
+            else:
+                corner_detected = False
+            self.corner_detected_pub.publish(corner_detected)
 
         # Draw lines
         for lines in [white_lines, yellow_lines]:
