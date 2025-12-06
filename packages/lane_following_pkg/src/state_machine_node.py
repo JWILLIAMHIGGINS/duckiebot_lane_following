@@ -1,5 +1,3 @@
-THREE
-
 #!/usr/bin/env python3
 # SDTS Node - Scenario Driven Transition System (Duckietown Compatible)
 # Supervises the LaneControllerNode according to Section 5 of the paper.
