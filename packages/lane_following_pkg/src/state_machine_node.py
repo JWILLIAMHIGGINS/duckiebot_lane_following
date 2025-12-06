@@ -44,13 +44,7 @@ class SDTSNode(DTROS):
 
         self.last_seen = rospy.Time.now()
         self.lines_visible = "none"
-
-        # === SUBSCRIBERS ===
-        rospy.Subscriber(f"/{self._veh}/lane_following/vanishing_point", Point, self.cb_vanish)
-        rospy.Subscriber(f"/{self._veh}/lane_following/mid_point", Point, self.cb_mid)
-        rospy.Subscriber(f"/{self._veh}/lane_following/corner_detected", Bool, self.cb_corner)
-        rospy.Subscriber(f"/{self._veh}/lane_following/corner_direction", String, self.cb_corner_dir)
-
+        
         # === PUBLISHERS ===
         # Recovery wheel commands
         self.wheels_pub = rospy.Publisher(
@@ -58,6 +52,14 @@ class SDTSNode(DTROS):
             WheelsCmdStamped,
             queue_size=1
         )
+
+        # === SUBSCRIBERS ===
+        rospy.Subscriber(f"/{self._veh}/lane_following/vanishing_point", Point, self.cb_vanish)
+        rospy.Subscriber(f"/{self._veh}/lane_following/mid_point", Point, self.cb_mid)
+        rospy.Subscriber(f"/{self._veh}/lane_following/corner_detected", Bool, self.cb_corner)
+        rospy.Subscriber(f"/{self._veh}/lane_following/corner_direction", String, self.cb_corner_dir)
+
+
 
         # State debug output
         self.state_pub = rospy.Publisher(
